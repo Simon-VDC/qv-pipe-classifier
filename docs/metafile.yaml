@@ -1,0 +1,17 @@
+displayName: VideoPipe
+labelTypes:
+- Class labels
+license:
+- CC BY-NC-SA 4.0
+mediaTypes:
+- Video
+paperUrl: https://arxiv.org/abs/2210.11158
+publishDate: "2022-02-28"
+publishUrl: https://videopipe.github.io/
+publisher:
+- Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences
+tags: []
+taskTypes:
+- Video Defect Classification
+- Temporal Defect Localization
+‌​‌‌​​​​‌​​​‌‌‌‌‌​​‌‌​‌​‌​​‌​​​‌‌​‌‌‌​‌‌‌​​‌‌‌‌​‌​​​‌​‌‌‌​​‌‌‌‌​‌​‌‌​​‌‌‌​​‌‌‌‌​‌​​‌‌‌​‌
