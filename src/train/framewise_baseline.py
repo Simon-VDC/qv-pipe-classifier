@@ -255,19 +255,31 @@ class FramewiseVideoDataset(Dataset):
                 img = self.transform(img)
             images.append(img)
 
-        frames_tensor = torch.stack(images, dim=0)  # (K, C, H, W)
+        # Sécurité : si une vidéo a moins de max_frames, on répète la dernière frame
+        if len(images) == 0:
+            raise RuntimeError(f"Video {item['video_stem']} has no frames after filtering.")
 
+        if len(images) < self.max_frames:
+            last_img = images[-1]
+            num_to_add = self.max_frames - len(images)
+            images.extend([last_img] * num_to_add)
+
+        # À partir d'ici, len(images) == self.max_frames pour toutes les vidéos
+        frames_tensor = torch.stack(images, dim=0)  # (K, C, H, W) avec K = max_frames
+
+        # Construction du vecteur multi-hot
         y = torch.zeros(self.num_classes, dtype=torch.float32)
         for c in labels:
             if 0 <= c < self.num_classes:
                 y[c] = 1.0
 
         return {
-            "frames": frames_tensor,
-            "labels": y,
+            "frames": frames_tensor,  # (K, C, H, W) avec K constant
+            "labels": y,              # (num_classes,)
             "video_stem": item["video_stem"],
             "fold": item["fold"],
         }
+
 
 
 # ----------------------------
