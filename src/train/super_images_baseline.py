@@ -1,6 +1,7 @@
 import os
 import argparse
 import random
+import json  # <--- ajouté
 
 import numpy as np
 import pandas as pd
@@ -299,6 +300,16 @@ def main():
     fold_dir = os.path.join(args.models_dir, f"fold_{args.fold}")
     os.makedirs(fold_dir, exist_ok=True)
     best_model_path = os.path.join(fold_dir, "best.pth")
+    history_path = os.path.join(fold_dir, "history.json")
+
+    # Historique (même esprit que baseline)
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "val_loss": [],
+        "val_map": [],
+        "best_map": None,
+    }
 
     # Boucle d'entraînement
     best_map = -1.0
@@ -314,6 +325,12 @@ def main():
         print(f"Train loss: {train_loss:.4f}")
         print(f"Val   loss: {val_loss:.4f} | Val mAP: {val_map:.4f}")
 
+        # Mise à jour de l'historique
+        history["epoch"].append(epoch)
+        history["train_loss"].append(float(train_loss))
+        history["val_loss"].append(float(val_loss))
+        history["val_map"].append(float(val_map) if not np.isnan(val_map) else None)
+
         # Sauvegarde du meilleur modèle (selon mAP)
         improved = False
         if not np.isnan(val_map) and val_map > best_map:
@@ -324,7 +341,13 @@ def main():
         if improved:
             print(f"[INFO] New best mAP: {best_map:.4f} -> model saved to {best_model_path}")
 
+    # Sauvegarde de l'historique en JSON
+    history["best_map"] = float(best_map)
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=4)
+
     print(f"\n[INFO] Training finished for fold {args.fold}. Best mAP = {best_map:.4f}")
+    print(f"[INFO] History saved to {history_path}")
 
 
 if __name__ == "__main__":
