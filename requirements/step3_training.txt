@@ -1,0 +1,8 @@
+# Step 3 - super-image training
+torch
+torchvision
+timm
+numpy
+pandas
+Pillow
+scikit-learn
