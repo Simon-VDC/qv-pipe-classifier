@@ -180,8 +180,8 @@ class CBFocalLoss(nn.Module):
         # Modulation focal
         focal_factor = (1 - p_t) ** self.gamma  # (B, C)
 
-        # Poids par classe (broadcast sur batch)
-        weights = self.class_weights.unsqueeze(0)  # (1, C)
+        # Poids par classe (broadcast sur batch) -> sur le même device que logits
+        weights = self.class_weights.to(logits.device).unsqueeze(0)  # (1, C)
 
         loss = bce * focal_factor * weights
         return loss.mean()
@@ -323,13 +323,13 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=15,   # ta nouvelle valeur cible
+        default=15,   # cible CB-Focal
         help="Nombre d'epochs.",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,    # adapté à ton setup A100 avec img_size=1344
+        default=4,    # adapté à img_size=1344 sur A100
         help="Taille de batch.",
     )
     parser.add_argument(
