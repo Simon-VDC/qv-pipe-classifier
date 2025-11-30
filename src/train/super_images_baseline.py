@@ -1,20 +1,8 @@
-"""
-src/train/super_images_baseline.py
-
-Baseline super-image 3x3 training script for QV Pipe (Step 3).
-
-- One sample = one video represented by a 3x3 super-image (single image)
-- Labels come from labels_str in the CSV (liste d'indices de classes)
-- Backbone: timm (ConvNeXt-Base par défaut)
-- Loss: Asymmetric Loss (ASL) pour multi-label déséquilibré
-- Optimizer: AdamW
-- Scheduler: CosineAnnealingLR
-"""
-
 import argparse
+import os
 import json
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
+import random
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,95 +11,260 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-
-from sklearn.metrics import average_precision_score
+from torchvision import transforms as T
 
 import timm
-import torchvision.transforms as T
+from sklearn.metrics import average_precision_score
+from torch.optim.lr_scheduler import OneCycleLR
 
 
-# ----------------------------
-# Asymmetric Loss (ASL)
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------------
 
-class AsymmetricLossMultiLabel(nn.Module):
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def parse_labels_str(s: str) -> List[int]:
     """
-    Asymmetric Loss (ASL) pour classification multi-label déséquilibrée.
-
-    Implémentation inspirée de la loss MIIL :
-      - gamma_neg > gamma_pos pour focaliser sur les faux négatifs,
-      - clip des probabilités négatives pour limiter l'impact des exemples très faciles.
+    Parse la chaîne labels_str du CSV en liste d'indices de classes.
+    Exemples :
+      "0"       -> [0]
+      "3 12"    -> [3, 12]
+      "5,7,8"   -> [5, 7, 8]
     """
+    if s is None:
+        return []
+    s = str(s).strip()
+    if s == "":
+        return []
+    # Remplace virgules par espaces, split, cast en int
+    parts = s.replace(",", " ").split()
+    return [int(p) for p in parts]
 
+
+def infer_num_classes(df: pd.DataFrame, labels_col: str = "labels_str") -> int:
+    """
+    Déduit num_classes à partir de la colonne labels_str du CSV.
+    num_classes = max_label + 1
+    """
+    max_label = -1
+    for s in df[labels_col].astype(str).tolist():
+        indices = parse_labels_str(s)
+        if len(indices) == 0:
+            continue
+        max_label = max(max_label, max(indices))
+    if max_label < 0:
+        raise ValueError("Impossible d'inférer num_classes (aucun label trouvé).")
+    return max_label + 1
+
+
+def get_transforms(img_size: int) -> Tuple[T.Compose, T.Compose]:
+    """
+    Crée les transforms train / val en fonction de img_size.
+    On garde exactement le pipeline de base :
+      - Resize (img_size, img_size)
+      - RandomHorizontalFlip pour le train
+      - ToTensor
+      - Normalize ImageNet
+    """
+    train_transform = T.Compose([
+        T.Resize((img_size, img_size)),
+        T.RandomHorizontalFlip(p=0.5),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ])
+
+    val_transform = T.Compose([
+        T.Resize((img_size, img_size)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]),
+    ])
+
+    return train_transform, val_transform
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class SuperImagesDataset(Dataset):
     def __init__(
         self,
-        gamma_pos: float = 0.0,
-        gamma_neg: float = 4.0,
-        clip: float = 0.05,
-        eps: float = 1e-8,
+        df: pd.DataFrame,
+        num_classes: int,
+        transform=None,
     ):
-        super().__init__()
-        self.gamma_pos = gamma_pos
-        self.gamma_neg = gamma_neg
-        self.clip = clip
-        self.eps = eps
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        logits : (B, C) scores bruts du modèle
-        targets: (B, C) labels multi-label {0,1}
+        df : DataFrame filtré (train OU val),
+             contenant au minimum les colonnes:
+               - "superimage_path"
+               - "labels_str"
         """
-        # Probas sigmoid
-        probas = torch.sigmoid(logits)
+        self.df = df.reset_index(drop=True)
+        self.num_classes = num_classes
+        self.transform = transform
 
-        # Séparation pos / neg
-        xs_pos = probas
-        xs_neg = 1.0 - probas
+    def __len__(self):
+        return len(self.df)
 
-        # Clip négatif pour réduire l'impact des exemples très faciles
-        if self.clip is not None and self.clip > 0:
-            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
 
-        # Logs sécurisés
-        log_pos = torch.log(xs_pos.clamp(min=self.eps))
-        log_neg = torch.log(xs_neg.clamp(min=self.eps))
+        img_path = row["superimage_path"]
+        labels_str = str(row["labels_str"])
 
-        # Focal modulating factor
-        if self.gamma_pos > 0 or self.gamma_neg > 0:
-            pt_pos = xs_pos * targets
-            pt_neg = xs_neg * (1.0 - targets)
+        # Ouvrir l'image
+        img = Image.open(img_path).convert("RGB")
 
-            one_sided_gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
-            focal_weight = torch.pow(1.0 - pt_pos - pt_neg, one_sided_gamma)
+        # Appliquer les transforms
+        if self.transform is not None:
+            img = self.transform(img)
 
-            log_pos = log_pos * focal_weight
-            log_neg = log_neg * focal_weight
+        # Créer le vecteur multi-hot
+        target = torch.zeros(self.num_classes, dtype=torch.float32)
+        label_indices = parse_labels_str(labels_str)
+        for c in label_indices:
+            if 0 <= c < self.num_classes:
+                target[c] = 1.0
 
-        loss_pos = targets * log_pos
-        loss_neg = (1.0 - targets) * log_neg
-
-        loss = -(loss_pos + loss_neg)
-        return loss.mean()
+        return img, target
 
 
-# ----------------------------
-# Utils
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Modèle & métriques
+# ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Baseline super-image 3x3 training (Step 3)")
-
-    parser.add_argument(
-        "--splits_csv",
-        type=str,
-        required=True,
-        help="CSV des super-images (ex: super_images_3x3_folds.csv ou version _colab).",
+def create_model(model_name: str, num_classes: int, pretrained: bool = True) -> nn.Module:
+    """
+    Crée un backbone timm avec une tête linéaire num_classes.
+    Par ex : convnext_base, tf_efficientnetv2_m, etc.
+    """
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=num_classes
     )
+    return model
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    criterion: nn.Module,
+):
+    model.eval()
+
+    all_targets = []
+    all_logits = []
+
+    running_loss = 0.0
+    n_samples = 0
+
+    for images, targets in dataloader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        logits = model(images)
+        loss = criterion(logits, targets)
+
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        n_samples += batch_size
+
+        all_targets.append(targets.detach().cpu())
+        all_logits.append(logits.detach().cpu())
+
+    if n_samples == 0:
+        return 0.0, 0.0, [0.0] * num_classes
+
+    val_loss = running_loss / n_samples
+
+    all_targets = torch.cat(all_targets, dim=0).numpy()
+    all_logits = torch.cat(all_logits, dim=0)
+    all_probs = torch.sigmoid(all_logits).numpy()
+
+    per_class_ap = []
+    for c in range(num_classes):
+        y_true = all_targets[:, c]
+        y_score = all_probs[:, c]
+
+        # Si aucune positive pour cette classe dans le set de val,
+        # average_precision_score lancerait un warning -> on ignore cette classe
+        if y_true.sum() == 0:
+            continue
+        ap = average_precision_score(y_true, y_score)
+        per_class_ap.append(ap)
+
+    if len(per_class_ap) == 0:
+        val_map = 0.0
+    else:
+        val_map = float(np.mean(per_class_ap))
+
+    return val_loss, val_map, per_class_ap
+
+
+# ---------------------------------------------------------------------------
+# Entraînement
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    scheduler: OneCycleLR,
+    criterion: nn.Module,
+):
+    model.train()
+
+    running_loss = 0.0
+    n_samples = 0
+
+    for images, targets in dataloader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, targets)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        n_samples += batch_size
+
+    if n_samples == 0:
+        return 0.0
+
+    return running_loss / n_samples
+
+
+# ---------------------------------------------------------------------------
+# Argparse & main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Baseline super-images 3x3 multi-label (ConvNeXt + BCE)."
+    )
+
     parser.add_argument(
-        "--models_dir",
+        "--csv_path",
         type=str,
         required=True,
-        help="Dossier où les checkpoints et l'historique seront sauvegardés.",
+        help="Chemin du CSV des super-images (super_images_3x3_folds_colab.csv).",
     )
     parser.add_argument(
         "--fold",
@@ -120,331 +273,103 @@ def parse_args() -> argparse.Namespace:
         help="Fold utilisé pour la validation (0-4). Train = tous les autres folds.",
     )
     parser.add_argument(
+        "--model_name",
+        type=str,
+        default="convnext_base",
+        help="Backbone timm (ex: convnext_base, tf_efficientnetv2_m, tresnet_xl, ...).",
+    )
+    parser.add_argument(
+        "--img_size",
+        type=int,
+        default=448,
+        help="Taille de redimensionnement des super-images (côté en pixels). "
+             "Ex : 448, 672, 896, 1344.",
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=20,
-        help="Nombre d'epochs d'entraînement.",
+        help="Nombre d'epochs.",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4,
-        help="Batch size.",
+        default=8,
+        help="Taille de batch.",
     )
     parser.add_argument(
         "--lr",
         type=float,
         default=1e-3,
-        help="Learning rate initial.",
+        help="LR max pour OneCycleLR.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay pour AdamW.",
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=4,
-        help="Nombre de workers pour le DataLoader.",
+        help="Nombre de workers pour les DataLoader.",
     )
     parser.add_argument(
-        "--model_name",
+        "--models_dir",
         type=str,
-        default="convnext_base",
-        help="Backbone timm (ex: convnext_base, tf_efficientnet_b4_ns, nfnet_f0, ...).",
+        default="models/super_images_convnext",
+        help="Répertoire racine où sauvegarder les modèles et histories.",
     )
     parser.add_argument(
-        "--image_size",
+        "--seed",
         type=int,
-        default=448,
-        help="Taille d'entrée (H=W).",
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Si activé, passe un seul batch dans le modèle puis sort.",
+        default=42,
+        help="Seed pour la reproductibilité.",
     )
 
-    args = parser.parse_args()
-    return args
+    return parser.parse_args()
 
-
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def set_seed(seed: int = 42) -> None:
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def parse_labels_str(labels_str: str) -> List[int]:
-    """
-    Même logique que dans framewise_baseline.py :
-    parse labels_str depuis le CSV (ex. '3 12' ou '3,12' ou '[3, 12]') en liste d'indices de classes (int).
-    """
-    if labels_str is None or (isinstance(labels_str, float) and np.isnan(labels_str)):
-        return []
-    s = str(labels_str).strip()
-    if not s:
-        return []
-    s = s.replace("[", "").replace("]", "")
-    tokens = [t for t in s.replace(",", " ").split() if t.strip() != ""]
-    return [int(t) for t in tokens]
-
-
-def build_superimage_table(
-    df: pd.DataFrame,
-) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    À partir du CSV des super-images, construit une structure de samples :
-
-      - video_stem
-      - fold
-      - labels (liste d'indices de classes)
-      - superimage_path (chemin vers l'image 3x3)
-
-    Et infère num_classes à partir de tous les labels.
-    """
-    df_valid = df.copy()
-    df_valid = df_valid[~df_valid["labels_str"].isna()]
-    df_valid = df_valid[~df_valid["fold"].isna()]
-
-    df_valid["fold"] = df_valid["fold"].astype(int)
-    df_valid["labels_list"] = df_valid["labels_str"].apply(parse_labels_str)
-
-    all_labels: List[int] = []
-    for lbls in df_valid["labels_list"].tolist():
-        all_labels.extend(lbls)
-    num_classes = max(all_labels) + 1 if len(all_labels) > 0 else 0
-
-    samples: List[Dict[str, Any]] = []
-
-    for _, row in df_valid.iterrows():
-        video_stem = row["video_stem"]
-        fold = int(row["fold"])
-        labels_list = row["labels_list"]
-        img_path = row["superimage_path"]
-
-        samples.append(
-            {
-                "video_stem": video_stem,
-                "fold": fold,
-                "labels": labels_list,
-                "superimage_path": img_path,
-            }
-        )
-
-    return samples, num_classes
-
-
-# ----------------------------
-# Dataset
-# ----------------------------
-
-class SuperImageDataset(Dataset):
-    """
-    Dataset pour les super-images 3x3.
-
-    sample = une super-image représentant une vidéo
-    labels = vecteur multi-hot (num_classes)
-    """
-
-    def __init__(
-        self,
-        samples: List[Dict[str, Any]],
-        num_classes: int,
-        image_size: int = 448,
-        train: bool = True,
-    ):
-        self.samples = samples
-        self.num_classes = num_classes
-
-        tfms = [
-            T.Resize((image_size, image_size)),
-        ]
-
-        # Augmentations seulement pour l'entraînement
-        if train:
-            tfms.append(T.RandomHorizontalFlip(p=0.5))
-
-        tfms.extend([
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ])
-
-        self.transform = T.Compose(tfms)
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int):
-        item = self.samples[idx]
-        img_path = item["superimage_path"]
-        labels = item["labels"]
-
-        # Chargement image (chemin absolu ou relatif, selon ce que contient le CSV)
-        with Image.open(img_path).convert("RGB") as img:
-            img = self.transform(img)
-
-        # Construction du vecteur multi-hot
-        y = torch.zeros(self.num_classes, dtype=torch.float32)
-        for c in labels:
-            if 0 <= c < self.num_classes:
-                y[c] = 1.0
-
-        return img, y
-
-
-# ----------------------------
-# Model
-# ----------------------------
-
-class SuperImageBaselineModel(nn.Module):
-    def __init__(self, model_name: str, num_classes: int):
-        super().__init__()
-        self.num_classes = num_classes
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=True,
-            num_classes=num_classes,
-            global_pool="avg",
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x : (B, C, H, W)
-        logits = self.backbone(x)  # (B, num_classes)
-        return logits
-
-
-# ----------------------------
-# Train / Val loops
-# ----------------------------
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-):
-    model.train()
-    running_loss = 0.0
-    running_samples = 0
-
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-
-        bs = labels.size(0)
-        running_loss += loss.item() * bs
-        running_samples += bs
-
-    avg_loss = running_loss / max(running_samples, 1)
-    return avg_loss
-
-
-def validate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-):
-    model.eval()
-    running_loss = 0.0
-    running_samples = 0
-
-    all_targets = []
-    all_scores = []
-
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            logits = model(images)
-            loss = criterion(logits, labels)
-
-            bs = labels.size(0)
-            running_loss += loss.item() * bs
-            running_samples += bs
-
-            probs = torch.sigmoid(logits)
-            all_targets.append(labels.cpu().numpy())
-            all_scores.append(probs.cpu().numpy())
-
-    avg_loss = running_loss / max(running_samples, 1)
-
-    if len(all_targets) > 0:
-        y_true = np.concatenate(all_targets, axis=0)
-        y_scores = np.concatenate(all_scores, axis=0)
-        try:
-            map_score = average_precision_score(y_true, y_scores, average="macro")
-        except Exception:
-            map_score = 0.0
-    else:
-        map_score = 0.0
-
-    return avg_loss, map_score
-
-
-# ----------------------------
-# Main
-# ----------------------------
 
 def main():
     args = parse_args()
-    set_seed(42)
-
-    splits_csv = Path(args.splits_csv)
-    models_dir = Path(args.models_dir)
-    ensure_dir(models_dir)
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
+    print(f"Using device: {device}")
 
-    print(f"[INFO] Loading splits CSV from {splits_csv}")
-    df = pd.read_csv(splits_csv)
+    # ------------------------------------------------------------------
+    # Chargement du CSV et split train/val
+    # ------------------------------------------------------------------
+    print(f"Loading CSV from {args.csv_path}")
+    df = pd.read_csv(args.csv_path)
 
-    required_cols = {"video_stem", "superimage_path", "labels_str", "fold"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in CSV: {missing}")
+    # Inférer le nombre de classes à partir des labels_str
+    num_classes = infer_num_classes(df, labels_col="labels_str")
+    print(f"Inferred num_classes = {num_classes}")
 
-    samples_all, num_classes = build_superimage_table(df)
-    print(f"[INFO] Found {len(samples_all)} super-images avec labels.")
-    print(f"[INFO] Inferred num_classes = {num_classes}")
+    # Split par fold :
+    #  - val : lignes avec fold == args.fold
+    #  - train : lignes avec fold != args.fold
+    val_df = df[df["fold"] == args.fold]
+    train_df = df[df["fold"] != args.fold]
 
-    if num_classes == 0:
-        raise ValueError("num_classes == 0, vérifier labels_str dans le CSV.")
+    print(f"Fold {args.fold} -> train samples: {len(train_df)}, val samples: {len(val_df)}")
 
-    fold_val = args.fold
-    samples_train = [s for s in samples_all if s["fold"] != fold_val]
-    samples_val = [s for s in samples_all if s["fold"] == fold_val]
+    # ------------------------------------------------------------------
+    # Transforms & Datasets
+    # ------------------------------------------------------------------
+    train_transform, val_transform = get_transforms(args.img_size)
 
-    print(f"[INFO] Fold {fold_val}: train samples = {len(samples_train)}, val samples = {len(samples_val)}")
-    if len(samples_train) == 0 or len(samples_val) == 0:
-        raise ValueError("Train ou val vide. Vérifier fold ou contenu du CSV.")
-
-    train_dataset = SuperImageDataset(
-        samples=samples_train,
+    train_dataset = SuperImagesDataset(
+        df=train_df,
         num_classes=num_classes,
-        image_size=args.image_size,
-        train=True,
+        transform=train_transform,
     )
-    val_dataset = SuperImageDataset(
-        samples=samples_val,
+    val_dataset = SuperImagesDataset(
+        df=val_df,
         num_classes=num_classes,
-        image_size=args.image_size,
-        train=False,
+        transform=val_transform,
     )
 
     train_loader = DataLoader(
@@ -453,6 +378,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        drop_last=False,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -460,91 +386,112 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        drop_last=False,
     )
 
-    print(f"[INFO] Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    print(f"[INFO] Creating backbone: {args.model_name}")
-    model = SuperImageBaselineModel(args.model_name, num_classes=num_classes).to(device)
+    # ------------------------------------------------------------------
+    # Modèle, loss, optimizer, scheduler
+    # ------------------------------------------------------------------
+    print(f"Creating model: {args.model_name}")
+    model = create_model(args.model_name, num_classes=num_classes, pretrained=True)
+    model.to(device)
 
-    # DRY RUN
-    if args.dry_run:
-        print("[INFO] Running DRY RUN (one batch through the model)...")
-        batch = next(iter(train_loader))
-        images, labels = batch
-        images = images.to(device)
-        labels = labels.to(device)
-        print(f"Batch images shape: {images.shape}")
-        print(f"Batch labels shape: {labels.shape}")
-        logits = model(images)
-        print(f"Logits shape: {logits.shape}")
-        print("[INFO] Dry run OK. Exiting.")
-        return
+    criterion = nn.BCEWithLogitsLoss()
 
-    # Perte : ASL pour dataset multi-label très déséquilibré
-    criterion = AsymmetricLossMultiLabel(
-        gamma_pos=0.0,
-        gamma_neg=4.0,
-        clip=0.05,
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    total_steps = len(train_loader) * args.epochs
+    if total_steps == 0:
+        raise RuntimeError("No training steps (empty train_loader).")
+
+    scheduler = OneCycleLR(
         optimizer,
-        T_max=args.epochs,
+        max_lr=args.lr,
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        pct_start=0.3,
+        anneal_strategy="cos",
+        div_factor=25.0,
+        final_div_factor=1e4,
     )
 
-    history = {"train_loss": [], "val_loss": [], "val_map": [], "lr": []}
-    best_map = -1.0
-    run_dir = models_dir / f"{args.model_name}_fold{args.fold}"
-    ensure_dir(run_dir)
-    best_ckpt_path = run_dir / "best_model.pth"
-    history_path = run_dir / "history.json"
+    # ------------------------------------------------------------------
+    # Préparation des sorties (dossiers, chemins)
+    # ------------------------------------------------------------------
+    fold_dir = os.path.join(args.models_dir, f"{args.model_name}_fold{args.fold}")
+    os.makedirs(fold_dir, exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
+    best_model_path = os.path.join(fold_dir, "best_model.pth")
+    history_path = os.path.join(fold_dir, "history.json")
+
+    # ------------------------------------------------------------------
+    # Boucle d'entraînement
+    # ------------------------------------------------------------------
+    best_val_map = -1.0
+    history = []
+
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
-        )
-        val_loss, val_map = validate(model, val_loader, criterion, device)
-        scheduler.step()
-        last_lr = optimizer.param_groups[0]["lr"]
-
-        print(
-            f"Epoch {epoch}: "
-            f"train_loss={train_loss:.4f}, "
-            f"val_loss={val_loss:.4f}, "
-            f"val_mAP={val_map:.4f}, "
-            f"lr={last_lr:.6f}"
+            model=model,
+            dataloader=train_loader,
+            device=device,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            criterion=criterion,
         )
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["val_map"].append(val_map)
-        history["lr"].append(last_lr)
+        val_loss, val_map, per_class_ap = evaluate(
+            model=model,
+            dataloader=val_loader,
+            device=device,
+            num_classes=num_classes,
+            criterion=criterion,
+        )
 
-        if val_map > best_map:
-            best_map = val_map
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_map": val_map,
-                    "args": vars(args),
-                },
-                best_ckpt_path,
-            )
-            print(f"New best mAP = {best_map:.4f} → checkpoint saved at {best_ckpt_path}")
+        current_lr = scheduler.get_last_lr()[0]
 
+        print(f"Train loss: {train_loss:.4f}")
+        print(f"Val loss  : {val_loss:.4f}")
+        print(f"Val mAP   : {val_map:.4f}")
+        print(f"LR        : {current_lr:.6f}")
+
+        # Sauvegarde historique
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "val_mAP": float(val_map),
+            "lr": float(current_lr),
+        })
+
+        # Sauvegarder le meilleur modèle
+        if val_map > best_val_map:
+            best_val_map = val_map
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "num_classes": num_classes,
+                "model_name": args.model_name,
+                "img_size": args.img_size,
+                "fold": args.fold,
+            }, best_model_path)
+            print(f"New best model saved at {best_model_path} (mAP={best_val_map:.4f})")
+
+        # Sauvegarde du history à chaque epoch (plus safe)
         with open(history_path, "w") as f:
-            json.dump(history, f, indent=4)
+            json.dump(history, f, indent=2)
 
     print("\nTraining finished.")
-    print(f"Best mAP on fold {args.fold} = {best_map:.4f}")
-    print(f"Best model saved at: {best_ckpt_path}")
-    print(f"History saved at:    {history_path}")
+    print(f"Best val mAP on fold {args.fold}: {best_val_map:.4f}")
+    print(f"Best model path: {best_model_path}")
+    print(f"History saved to: {history_path}")
 
 
 if __name__ == "__main__":
