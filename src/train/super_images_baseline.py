@@ -4,9 +4,9 @@ src/train/super_images_baseline.py
 Baseline super-image 3x3 training script for QV Pipe (Step 3).
 
 - One sample = one video represented by a 3x3 super-image (single image)
-- Labels come from labels_str in the CSV (same logique que framewise_baseline.py)
-- Backbone: timm (ConvNeXt base par défaut)
-- Loss: BCEWithLogitsLoss (multi-label)
+- Labels come from labels_str in the CSV (liste d'indices de classes)
+- Backbone: timm (ConvNeXt-Base par défaut)
+- Loss: Asymmetric Loss (ASL) pour multi-label déséquilibré
 - Optimizer: AdamW
 - Scheduler: CosineAnnealingLR
 """
@@ -28,6 +28,70 @@ from sklearn.metrics import average_precision_score
 
 import timm
 import torchvision.transforms as T
+
+
+# ----------------------------
+# Asymmetric Loss (ASL)
+# ----------------------------
+
+class AsymmetricLossMultiLabel(nn.Module):
+    """
+    Asymmetric Loss (ASL) pour classification multi-label déséquilibrée.
+
+    Implémentation inspirée de la loss MIIL :
+      - gamma_neg > gamma_pos pour focaliser sur les faux négatifs,
+      - clip des probabilités négatives pour limiter l'impact des exemples très faciles.
+    """
+
+    def __init__(
+        self,
+        gamma_pos: float = 0.0,
+        gamma_neg: float = 4.0,
+        clip: float = 0.05,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits : (B, C) scores bruts du modèle
+        targets: (B, C) labels multi-label {0,1}
+        """
+        # Probas sigmoid
+        probas = torch.sigmoid(logits)
+
+        # Séparation pos / neg
+        xs_pos = probas
+        xs_neg = 1.0 - probas
+
+        # Clip négatif pour réduire l'impact des exemples très faciles
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+
+        # Logs sécurisés
+        log_pos = torch.log(xs_pos.clamp(min=self.eps))
+        log_neg = torch.log(xs_neg.clamp(min=self.eps))
+
+        # Focal modulating factor
+        if self.gamma_pos > 0 or self.gamma_neg > 0:
+            pt_pos = xs_pos * targets
+            pt_neg = xs_neg * (1.0 - targets)
+
+            one_sided_gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            focal_weight = torch.pow(1.0 - pt_pos - pt_neg, one_sided_gamma)
+
+            log_pos = log_pos * focal_weight
+            log_neg = log_neg * focal_weight
+
+        loss_pos = targets * log_pos
+        loss_neg = (1.0 - targets) * log_neg
+
+        loss = -(loss_pos + loss_neg)
+        return loss.mean()
 
 
 # ----------------------------
@@ -58,13 +122,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=20,
         help="Nombre d'epochs d'entraînement.",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=4,
         help="Batch size.",
     )
     parser.add_argument(
@@ -190,20 +254,28 @@ class SuperImageDataset(Dataset):
         samples: List[Dict[str, Any]],
         num_classes: int,
         image_size: int = 448,
+        train: bool = True,
     ):
         self.samples = samples
         self.num_classes = num_classes
 
-        self.transform = T.Compose(
-            [
-                T.Resize((image_size, image_size)),
-                T.ToTensor(),
-                T.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ]
-        )
+        tfms = [
+            T.Resize((image_size, image_size)),
+        ]
+
+        # Augmentations seulement pour l'entraînement
+        if train:
+            tfms.append(T.RandomHorizontalFlip(p=0.5))
+
+        tfms.extend([
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+
+        self.transform = T.Compose(tfms)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -366,11 +438,13 @@ def main():
         samples=samples_train,
         num_classes=num_classes,
         image_size=args.image_size,
+        train=True,
     )
     val_dataset = SuperImageDataset(
         samples=samples_val,
         num_classes=num_classes,
         image_size=args.image_size,
+        train=False,
     )
 
     train_loader = DataLoader(
@@ -407,7 +481,13 @@ def main():
         print("[INFO] Dry run OK. Exiting.")
         return
 
-    criterion = nn.BCEWithLogitsLoss()
+    # Perte : ASL pour dataset multi-label très déséquilibré
+    criterion = AsymmetricLossMultiLabel(
+        gamma_pos=0.0,
+        gamma_neg=4.0,
+        clip=0.05,
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -459,7 +539,7 @@ def main():
             print(f"New best mAP = {best_map:.4f} → checkpoint saved at {best_ckpt_path}")
 
         with open(history_path, "w") as f:
-            json.dump(history, f)
+            json.dump(history, f, indent=4)
 
     print("\nTraining finished.")
     print(f"Best mAP on fold {args.fold} = {best_map:.4f}")
